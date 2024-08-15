@@ -12,7 +12,7 @@ import numpy as np
 # A dictionary to store rewards for pairs of reference and hypothesis reports
 
 
-def compute_largest_cluster(sentences):
+def compute_largest_cluster(sentences, clustering_model):
     """
     Computes the largest cluster of sentences using K-means clustering, finds the sentences within the largest cluster, and orders them by their distance to the cluster center.
 
@@ -27,7 +27,7 @@ def compute_largest_cluster(sentences):
     """
     if len(sentences) == 0:
         return None, None
-    embeddings, kmeans = compute_kmeans(sentences)
+    embeddings, kmeans = compute_kmeans(sentences, clustering_model)
     cluster_sizes = np.bincount(kmeans.labels_)
     largest_cluster_idx = np.argmax(cluster_sizes)
     cluster_member_ids = np.where(kmeans.labels_ == largest_cluster_idx)[0]
@@ -45,7 +45,7 @@ def compute_largest_cluster(sentences):
     return embeddings, sentences_of_largest_cluster
 
 
-def compute_kmeans(sentences):
+def compute_kmeans(sentences, clustering_model):
     """
     Computes K-means clustering for a list of sentences by generating their embeddings, normalizing the embeddings, and determining the optimal number of clusters using binary search.
 
@@ -58,7 +58,7 @@ def compute_kmeans(sentences):
             - kmeans (KMeans): The KMeans object with the optimal number of clusters determined.
     """
     # sentence embeddings
-    model = SentenceTransformer("sentence-transformers/paraphrase-mpnet-base-v2")
+    model = SentenceTransformer(clustering_model, local_files_only=True)
     embeddings = model.encode(sentences)
     # normalize the embeddings for equivalent computation of the cosine distance
     embeddings = preprocessing.normalize(embeddings)

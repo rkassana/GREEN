@@ -1,16 +1,12 @@
 import re
 import torch
-import torch.distributed as dist
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import pandas as pd
-from datasets import Dataset
-from datasets.distributed import split_dataset_by_node
 import os
+import time
 from tqdm import tqdm
 import numpy as np
-import time
 from .utils import (
-    gather_processes,
     make_prompt,
     clean_responses,
     compute_largest_cluster,
@@ -33,13 +29,11 @@ class Inferer:
         num_examples=None,
         batch_size=10,
         max_length=2048,
+        clustering_model=None,
     ):
 
-        self.dataset = Dataset.from_dict(
-            {"reference": dataset[0], "prediction": dataset[1]}
-        )
+        self.dataset = {"reference": dataset[0], "prediction": dataset[1]}
         self.process_data()
-
         self.model = model
         self.model_name = model_name
         self.tokenizer = tokenizer
@@ -53,6 +47,7 @@ class Inferer:
         self.completions = None
         self.green_scores = None
         self.error_counts = None
+        self.clustering_model = clustering_model
 
         self.categories = [
             "Clinically Significant Errors",
@@ -82,47 +77,33 @@ class Inferer:
                 ]
             }
 
-        self.dataset = self.dataset.map(promting, batched=True)
+        self.dataset.update(promting(self.dataset))
         print("Done.")
 
-    @torch.inference_mode()
+
+    def prepare_batches(self, prompts, batch_size=16):
+        prompts_values = prompts["prompt"]
+        batches=[prompts_values[i:i + batch_size] for i in range(0, len(prompts_values), batch_size)]
+        return batches
     def infer(self):
-
-        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-            dataset_dist = split_dataset_by_node(
-                self.dataset,
-                rank=int(os.environ["RANK"]),
-                world_size=int(os.environ["WORLD_SIZE"]),
-            )
-            print("Distributed dataset created on rank: ", int(os.environ["RANK"]))
-        else:
-            dataset_dist = self.dataset
-
         print("==== Beginning Inference ====")
-        local_completions = []
-        local_references = []
-
-        for batch in tqdm(
-            dataset_dist.iter(batch_size=self.batch_size),
-            total=len(dataset_dist) // self.batch_size,
-        ):
-            local_references.extend(batch["prompt"])
-            local_completions.extend(self.get_response(batch))
-
-        # gather results if multi gpu and single gpu settings
-        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-            self.completions, self.prompts = gather_processes(
-                local_completions, local_references
-            )
-        else:
-            self.completions = local_completions
-            self.prompts = local_references
-
-        print("==== End Inference ====")
-
-        if len(self.completions) != len(self.prompts):
-            print("length of prompts and completions are not equal!")
-
+        results=dict(outputs=[])
+        prompt_batches = self.prepare_batches(self.dataset)
+                
+        for prompts_batch in tqdm(prompt_batches):
+            result_gpu = self.get_response({"prompt":prompts_batch})
+            results["outputs"].append(result_gpu)
+        results = [ results ]
+        print("==== End Inference on GPU ====")
+        
+        # collect results from all the GPUs
+        candidates_list = []
+        #self.accelerator.wait_for_everyone()
+        for gpu_results in results:
+            for completion in gpu_results['outputs']:
+                candidates_list.extend(completion)
+        self.completions = candidates_list
+        print(f"lenght of totla cand : {len(self.completions)}")
         self.process_results()
 
     def tokenize_batch_as_chat(self, batch):
@@ -141,7 +122,7 @@ class Inferer:
             padding=True,
             truncation=True,
             max_length=self.max_length,
-        ).to(int(os.environ.get("LOCAL_RANK", 0)))
+        ).to("cuda")
 
         return batch
 
@@ -191,6 +172,12 @@ class Inferer:
             [self.compute_error_count(response) for response in self.completions],
             columns=self.sub_categories + ["Matched Findings"],
         )
+
+        print(len(self.dataset["reference"]))
+        print(len(self.dataset["prediction"]))
+        print(len(self.completions))
+        print(len(self.green_scores))
+
 
         results_df = pd.DataFrame(
             {
@@ -329,6 +316,7 @@ class Inferer:
                 f"({i})" + " " for i in range(1, len(self.sub_categories) + 1)
             ]
 
+        sub_category_dict_sentences = {}
         for position, sub_category in enumerate(self.sub_categories):
             # need to loop over all matches, because the sub_categories are not always in the same order
             for match in range(len(matches)):
@@ -360,7 +348,7 @@ class Inferer:
         for i in self.sub_categories:
             sentences = dict_sentences[i]
             sentences = [i for i in sentences if i.strip() != ""]
-            _, sentences_of_largest_cluster = compute_largest_cluster(sentences)
+            _, sentences_of_largest_cluster = compute_largest_cluster(sentences, self.clustering_model)
             result_sentences_dict[i] = sentences_of_largest_cluster
 
         return result_sentences_dict
@@ -404,30 +392,23 @@ class Inferer:
             str: green summary.
         """
         print("Computing summary ...")
-        representative_sentences = self.get_representative_sentences(self.completions)
+        #representative_sentences = self.get_representative_sentences(self.completions)
+        
         accuracies = self.compute_accuracy(self.completions)
 
-        summary = f"[Summary]: Green average {np.mean(self.green_scores)} and standard variation {np.std(self.green_scores)} \n [Clinically Significant Errors Analyses]: <accuracy>. <representative error>\n\n (a) False report of a finding in the candidate: {accuracies[self.sub_categories[0]]}. \n {representative_sentences[self.sub_categories[0]]} \n\n (b) Missing a finding present in the reference: {accuracies[self.sub_categories[1]]}. \n {representative_sentences[self.sub_categories[1]]} \n\n (c) Misidentification of a finding's anatomic location/position: {accuracies[self.sub_categories[2]]}. \n {representative_sentences[self.sub_categories[2]]} \n\n (d) Misassessment of the severity of a finding: {accuracies[self.sub_categories[3]]}. \n {representative_sentences[self.sub_categories[3]]} \n\n (e) Mentioning a comparison that isn't in the reference: {accuracies[self.sub_categories[4]]}. \n {representative_sentences[self.sub_categories[4]]} \n\n (f) Omitting a comparison detailing a change from a prior study: {accuracies[self.sub_categories[5]]}. {representative_sentences[self.sub_categories[5]]}."
+        summary = f"[Summary]: Green average {np.mean(self.green_scores)} and standard variation {np.std(self.green_scores)} \n [Clinically Significant Errors Analyses]: <accuracy>\n\n (a) False report of a finding in the candidate: {accuracies[self.sub_categories[0]]}. \n\n (b) Missing a finding present in the reference: {accuracies[self.sub_categories[1]]}.\n\n (c) Misidentification of a finding's anatomic location/position: {accuracies[self.sub_categories[2]]}.\n\n (d) Misassessment of the severity of a finding: {accuracies[self.sub_categories[3]]}.\n\n (e) Mentioning a comparison that isn't in the reference: {accuracies[self.sub_categories[4]]}.\n\n (f) Omitting a comparison detailing a change from a prior study: {accuracies[self.sub_categories[5]]}."
 
         print(summary)
 
 
-def compute(model_name, refs, hyps, output_dir="."):
+def compute(model_name, refs, hyps, clustering_model, output_dir="."):
     chat_template = "{% for message in messages %}\n{% if message['from'] == 'human' %}\n{{ '<|user|>\n' + message['value'] + eos_token }}\n{% elif message['from'] == 'system' %}\n{{ '<|system|>\n' + message['value'] + eos_token }}\n{% elif message['from'] == 'gpt' %}\n{{ '<|assistant|>\n'  + message['value'] + eos_token }}\n{% endif %}\n{% if loop.last and add_generation_prompt %}\n{{ '<|assistant|>' }}\n{% endif %}\n{% endfor %}"
-
-    if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-        dist.init_process_group(
-            backend="nccl",
-        )  # 'nccl' is recommended for GPUs
-        torch.cuda.set_device(dist.get_rank())
-        if dist.get_rank() == 0:
-            print("Distributed training with", torch.cuda.device_count(), "GPUs")
 
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         trust_remote_code=True,
-        device_map={"": "cuda:{}".format(torch.cuda.current_device())},
-        torch_dtype=torch.float16,
+        device_map="cuda",
+        torch_dtype=torch.bfloat16,
     )
     model.eval()
 
@@ -440,13 +421,16 @@ def compute(model_name, refs, hyps, output_dir="."):
     )
     tokenizer.chat_template = chat_template
     tokenizer.pad_token = tokenizer.eos_token
-
+    
+    start=time.time()
+    
     inferer = Inferer(
         dataset=[refs, hyps],
         model=model,
         tokenizer=tokenizer,
         output_dir=output_dir,
         batch_size=16,
+        clustering_model = clustering_model
     )
 
     t = time.time()
@@ -458,11 +442,7 @@ def compute(model_name, refs, hyps, output_dir="."):
 
 
 if __name__ == "__main__":
-    import time
-
-    refs = [
-        "Interstitial opacities without changes.",
-        "Interval development of segmental heterogeneous airspace opacities throughout the lungs . No significant pneumothorax or pleural effusion . Bilateral calcified pleural plaques are scattered throughout the lungs . The heart is not significantly enlarged .",
+    refs= [  "Interval development of segmental heterogeneous airspace opacities throughout the lungs . No significant pneumothorax or pleural effusion . Bilateral calcified pleural plaques are scattered throughout the lungs . The heart is not significantly enlarged .",
         "Bibasilar atelectasis. Otherwise, no acute intrathoracic process.",
         "Lung volumes are low, causing bronchovascular crowding. The cardiomediastinal silhouette is unremarkable. No focal consolidation, pleural effusion, or pneumothorax detected. Within the limitations of chest radiography, osseous structures are unremarkable.",
         "Interval resolution of previously seen mild pulmonary edema with trace bilateral pleural effusions.",
@@ -483,6 +463,6 @@ if __name__ == "__main__":
         "1. Mild left basal atelectasis. Otherwise unremarkable. 2. No definite displaced rib fracture though if there is continued concern dedicated rib series may be performed to further assess.",
     ]
 
-    model_name = "StanfordAIMI/GREEN-radllama2-7b"
+    model_name = "/fs/data/f2i/MODELS/huggingface/green/GREEN-RadPhi2/GREEN-RadPhi2/"
 
-    compute(model_name, refs, hyps, output_dir=".")
+    compute(model_name, refs, hyps, output_dir=".", clustering_model='')
